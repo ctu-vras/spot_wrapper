@@ -1838,6 +1838,182 @@ class SpotWrapper:
 
     ###################################################################
 
+    # Arm-custom ######################################################
+
+    @try_claim
+    def grasp_in_image(self, camera, coord):
+        """grasp object at xy coordinates in camera image without moving the robot body
+        it is expected, that the robot is already powered on and standing"""
+        try:
+            # Stow Arm
+            stow = RobotCommandBuilder.arm_stow_command()
+
+            # Command issue with RobotCommandClient
+            self._robot_command_client.robot_command(stow)
+            self._logger.info("Command stow issued")
+            time.sleep(2.0)
+            source = camera
+
+            image_request = [build_image_request(source, image_format=image_pb2.Image.FORMAT_RAW)]
+            image_responses = self._image_client.get_image(image_request)
+            image = image_responses[0]
+
+            pick_vec = geometry_pb2.Vec2(x=coord[0], y=coord[1])
+            grasp = manipulation_api_pb2.PickObjectInImage(
+                pixel_xy=pick_vec,
+                transforms_snapshot_for_camera=image.shot.transforms_snapshot,
+                frame_name_image_sensor=image.shot.frame_name_image_sensor,
+                camera_model=image.source.pinhole,
+                walk_gaze_mode=2)
+
+            gripper_align = geometry_pb2.Vec3(x=1, y=0, z=0)
+            vertical_align = geometry_pb2.Vec3(x=0, y=0, z=-1)
+            constraint = grasp.grasp_params.allowable_orientation.add()
+            constraint.vector_alignment_with_tolerance.axis_on_gripper_ewrt_gripper.CopyFrom(gripper_align)
+            constraint.vector_alignment_with_tolerance.axis_to_align_with_ewrt_frame.CopyFrom(vertical_align)
+            constraint.vector_alignment_with_tolerance.threshold_radians = 0.1*3.14
+            grasp.grasp_params.grasp_params_frame_name = frame_helpers.VISION_FRAME_NAME
+            grasp.grasp_params.grasp_palm_to_fingertip = 0.75
+
+            grasp_request = manipulation_api_pb2.ManipulationApiRequest(
+                pick_object_in_image=grasp)
+            response = self._manipulation_api_client.manipulation_api_command(manipulation_api_request=grasp_request)
+            command_id = response.manipulation_cmd_id
+            self._logger.info("Command GraspInImage issued")
+            time.sleep(1.0)
+            feedback_request = manipulation_api_pb2.ManipulationApiFeedbackRequest(manipulation_cmd_id=command_id)
+            done = False
+            fail = False
+            while not done:
+                feedback_response = self._manipulation_api_client.manipulation_api_feedback_command(feedback_request)
+                done = feedback_response.current_state == manipulation_api_pb2.MANIP_STATE_GRASP_SUCCEEDED
+                if feedback_response.current_state == manipulation_api_pb2.MANIP_STATE_GRASP_FAILED:
+                    self._logger.warn("Grasp failed, stowing arm")
+                    fail = True
+                    break
+                time.sleep(0.5)
+
+            time.sleep(1.0)
+            success = True
+            if not fail:
+                command = RobotCommandBuilder.claw_gripper_close_command()
+                self._robot_command_client.robot_command(command)
+                self._logger.info("Gripper close issued")
+                time.sleep(1.0)
+
+                carry = RobotCommandBuilder.arm_carry_command()
+                self._robot_command_client.robot_command(carry)
+                self._logger.info("Command carry issued")
+                time.sleep(2.0)
+
+                self._logger.info('Verifying grasp success')
+                success = self.is_holding()
+                if not success:
+                    self._logger.warn("Gripper is empty, grasp unsuccessful, stowing arm")
+                    self._robot_command(RobotCommandBuilder.stop_command())
+                    time.sleep(1.0)
+                    command = RobotCommandBuilder.claw_gripper_open_command()
+                    self._robot_command_client.robot_command(command)
+                    time.sleep(2.0)
+                else:
+                    self._logger.info("Grasp was successful")
+            if not success or fail:
+                stow = RobotCommandBuilder.arm_stow_command()
+                self._robot_command_client.robot_command(stow)
+                self._logger.info("Stow command issued")
+                time.sleep(2.0)
+                command = RobotCommandBuilder.claw_gripper_close_command()
+                self._robot_command_client.robot_command(command)
+                self._logger.info("Gripper close issued")
+                time.sleep(2.0)
+                return False
+            return True
+
+        except Exception as e:
+            print (e)
+            return False
+
+    def is_holding(self):
+        """verify if gripper is holding object from load of the finger joint"""
+        fgr_load = 0
+        for i in range(3):
+            st = self._robot_state_client.get_robot_state()
+            joints = st.kinematic_state.joint_states
+            for joint in joints:
+                if joint.name == 'arm0.f1x':
+                    fgr_load += joint.load.value
+            time.sleep(0.1)
+        fgr_load = fgr_load/3.
+        self._logger.info("Gripper load is %.3f" % (fgr_load))
+        return fgr_load > 0.5
+
+    @try_claim
+    def cartesian_trajectory(self, root_frame, traj_time, poses):
+        """move arm (hand frame) along the given trajectory in the given frame"""
+        points = []
+        time_increment = traj_time/len(poses)
+        point_time = 0
+        try:
+            for pose in poses:
+                x = pose[0][0]
+                y = pose[0][1]
+                z = pose[0][2]
+                hand_ewrt_root = geometry_pb2.Vec3(x=x, y=y, z=z)
+
+                # Rotation as a quaternion
+                qw = pose[1][3]
+                qx = pose[1][0]
+                qy = pose[1][1]
+                qz = pose[1][2]
+                root_Q_hand = geometry_pb2.Quaternion(w=qw, x=qx, y=qy, z=qz)
+
+                root_T_hand = geometry_pb2.SE3Pose(position=hand_ewrt_root, rotation=root_Q_hand)
+
+                robot_state = self._robot_state_client.get_robot_state()
+                odom_T_root = frame_helpers.get_a_tform_b(robot_state.kinematic_state.transforms_snapshot,
+                                            frame_helpers.GRAV_ALIGNED_BODY_FRAME_NAME, root_frame)
+
+                odom_T_hand = odom_T_root * math_helpers.SE3Pose.from_obj(root_T_hand)
+
+                traj_point = trajectory_pb2.SE3TrajectoryPoint(
+                    pose=odom_T_hand.to_proto(), time_since_reference=seconds_to_duration(point_time))
+                point_time += time_increment
+                points += [traj_point]
+
+            hand_traj = trajectory_pb2.SE3Trajectory(points=points)
+
+            arm_cartesian_command = arm_command_pb2.ArmCartesianCommand.Request(
+                pose_trajectory_in_task=hand_traj, root_frame_name=frame_helpers.GRAV_ALIGNED_BODY_FRAME_NAME)
+            arm_command = arm_command_pb2.ArmCommand.Request(arm_cartesian_command=arm_cartesian_command)
+            synchronized_command = synchronized_command_pb2.SynchronizedCommand.Request(arm_command=arm_command)
+            robot_command = robot_command_pb2.RobotCommand(synchronized_command=synchronized_command)
+            cmd_id = self._robot_command_client.robot_command(robot_command)
+            while True:
+                feedback_resp = self._robot_command_client.robot_command_feedback(cmd_id)
+                self._logger.info('Distance to final point: ' + '{:.2f} meters'.format(
+                    feedback_resp.feedback.synchronized_feedback.arm_command_feedback.
+                    arm_cartesian_feedback.measured_pos_distance_to_goal) + ', {:.2f} radians'.format(
+                    feedback_resp.feedback.synchronized_feedback.arm_command_feedback.
+                    arm_cartesian_feedback.measured_rot_distance_to_goal))
+
+                if feedback_resp.feedback.synchronized_feedback.arm_command_feedback.arm_cartesian_feedback.status ==\
+                        arm_command_pb2.ArmCartesianCommand.Feedback.STATUS_TRAJECTORY_COMPLETE:
+                    self._logger.info('Move complete.')
+                    break
+                if feedback_resp.feedback.synchronized_feedback.arm_command_feedback.arm_cartesian_feedback.status ==\
+                        arm_command_pb2.ArmCartesianCommand.Feedback.STATUS_TRAJECTORY_STALLED:
+                    self._logger.warn('Robot stalled, stop command issued. Trajectory point is unreachable')
+                    self._robot_command(RobotCommandBuilder.stop_command())
+                    break
+                time.sleep(0.1)
+            return True
+
+        except Exception as e:
+            print(e)
+            return False
+
+    ###################################################################
+
     ## copy from spot-sdk/python/examples/graph_nav_command_line/graph_nav_command_line.py
     def _get_localization_state(self, *args):
         """Get the current localization and state of the robot."""
