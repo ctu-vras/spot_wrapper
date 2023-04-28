@@ -2012,7 +2012,7 @@ class SpotWrapper:
             print(e)
             return False
 
-    def arm_gaze(self, point):
+    def arm_gaze(self, point, frame):
         unstow = RobotCommandBuilder.arm_ready_command()
 
         # Issue the command via the RobotCommandClient
@@ -2020,7 +2020,7 @@ class SpotWrapper:
         self._logger.info("Unstow command issued.")
         block_until_arm_arrives(self._robot_command_client, unstow_command_id, 3.0)
 
-        gaze_command = RobotCommandBuilder.arm_gaze_command(point[0],point[1],point[2], frame_helpers.ODOM_FRAME_NAME)
+        gaze_command = RobotCommandBuilder.arm_gaze_command(point[0],point[1],point[2], frame)
         gripper_command = RobotCommandBuilder.claw_gripper_open_command()
         synchro_command = RobotCommandBuilder.build_synchro_command(gripper_command, gaze_command)
 
@@ -2029,6 +2029,7 @@ class SpotWrapper:
         gaze_command_id = self._robot_command_client.robot_command(synchro_command)
 
         block_until_arm_arrives(command_client, gaze_command_id, 4.0)
+        return True
 
     ###################################################################
 
