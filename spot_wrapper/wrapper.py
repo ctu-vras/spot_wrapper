@@ -1911,9 +1911,10 @@ class SpotWrapper:
                     self._logger.warn("Gripper is empty, grasp unsuccessful, stowing arm")
                     self._robot_command(RobotCommandBuilder.stop_command())
                     time.sleep(1.0)
-                    command = RobotCommandBuilder.claw_gripper_open_command()
-                    self._robot_command_client.robot_command(command)
-                    time.sleep(2.0)
+                    override = manipulation_api_pb2.ApiGraspOverrideRequest()
+                    override.api_grasp_override.override_request = manipulation_api_pb2.ApiGraspOverride.Override.OVERRIDE_NOT_HOLDING
+                    self._manipulation_client.grasp_override_command(grasp_override_request=override)
+                    time.sleep(1.0)
                 else:
                     self._logger.info("Grasp was successful")
             if not success or fail:
