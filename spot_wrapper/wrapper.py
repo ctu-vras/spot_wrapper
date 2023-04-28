@@ -2012,6 +2012,24 @@ class SpotWrapper:
             print(e)
             return False
 
+    def arm_gaze(self, point):
+        unstow = RobotCommandBuilder.arm_ready_command()
+
+        # Issue the command via the RobotCommandClient
+        unstow_command_id = self._robot_command_client.robot_command(unstow)
+        self._logger.info("Unstow command issued.")
+        block_until_arm_arrives(self._robot_command_client, unstow_command_id, 3.0)
+
+        gaze_command = RobotCommandBuilder.arm_gaze_command(point[0],point[1],point[2], frame_helpers.ODOM_FRAME_NAME)
+        gripper_command = RobotCommandBuilder.claw_gripper_open_command()
+        synchro_command = RobotCommandBuilder.build_synchro_command(gripper_command, gaze_command)
+
+        # Send the request
+        self._logger.info("Requesting gaze.")
+        gaze_command_id = self._robot_command_client.robot_command(synchro_command)
+
+        block_until_arm_arrives(command_client, gaze_command_id, 4.0)
+
     ###################################################################
 
     ## copy from spot-sdk/python/examples/graph_nav_command_line/graph_nav_command_line.py
