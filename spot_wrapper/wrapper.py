@@ -1863,8 +1863,7 @@ class SpotWrapper:
                 pixel_xy=pick_vec,
                 transforms_snapshot_for_camera=image.shot.transforms_snapshot,
                 frame_name_image_sensor=image.shot.frame_name_image_sensor,
-                camera_model=image.source.pinhole,
-                walk_gaze_mode=2)
+                camera_model=image.source.pinhole)
 
             gripper_align = geometry_pb2.Vec3(x=1, y=0, z=0)
             vertical_align = geometry_pb2.Vec3(x=0, y=0, z=-1)
