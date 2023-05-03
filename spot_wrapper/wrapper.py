@@ -1842,7 +1842,7 @@ class SpotWrapper:
 
     @try_claim
     def grasp_in_image(self, camera, coord):
-        """grasp object at xy coordinates in camera image without moving the robot body
+        """grasp object at xy coordinates in camera image
         it is expected, that the robot is already powered on and standing"""
         try:
             # Stow Arm
@@ -1881,57 +1881,58 @@ class SpotWrapper:
             self._logger.info("Command GraspInImage issued")
             time.sleep(1.0)
             feedback_request = manipulation_api_pb2.ManipulationApiFeedbackRequest(manipulation_cmd_id=command_id)
-            done = False
-            fail = False
-            while not done:
+            while True:
                 feedback_response = self._manipulation_api_client.manipulation_api_feedback_command(feedback_request)
-                done = feedback_response.current_state == manipulation_api_pb2.MANIP_STATE_GRASP_SUCCEEDED
-                if feedback_response.current_state == manipulation_api_pb2.MANIP_STATE_GRASP_FAILED:
-                    self._logger.warn("Grasp failed, stowing arm")
-                    fail = True
+                print("Current state: ", manipulation_api_pb2.ManipulationFeedbackState.Name(feedback_response.current_state))
+                if (feedback_response.current_state == manipulation_api_pb2.MANIP_STATE_GRASP_SUCCEEDED or
+                feedback_response.current_state == manipulation_api_pb2.MANIP_STATE_GRASP_FAILED):
                     break
                 time.sleep(0.5)
 
-            time.sleep(1.0)
-            success = True
-            if not fail:
-                command = RobotCommandBuilder.claw_gripper_close_command()
-                self._robot_command_client.robot_command(command)
-                self._logger.info("Gripper close issued")
-                time.sleep(1.0)
-
-                carry = RobotCommandBuilder.arm_carry_command()
-                self._robot_command_client.robot_command(carry)
-                self._logger.info("Command carry issued")
-                time.sleep(2.0)
-
-                self._logger.info('Verifying grasp success')
-                success = self.is_holding()
-                if not success:
-                    self._logger.warn("Gripper is empty, grasp unsuccessful, stowing arm")
-                    self._robot_command(RobotCommandBuilder.stop_command())
-                    time.sleep(1.0)
-                    override = manipulation_api_pb2.ApiGraspOverrideRequest()
-                    override.api_grasp_override.override_request = manipulation_api_pb2.ApiGraspOverride.Override.OVERRIDE_NOT_HOLDING
-                    self._manipulation_client.grasp_override_command(grasp_override_request=override)
-                    time.sleep(1.0)
-                else:
-                    self._logger.info("Grasp was successful")
-            if not success or fail:
-                stow = RobotCommandBuilder.arm_stow_command()
-                self._robot_command_client.robot_command(stow)
-                self._logger.info("Stow command issued")
-                time.sleep(2.0)
-                command = RobotCommandBuilder.claw_gripper_close_command()
-                self._robot_command_client.robot_command(command)
-                self._logger.info("Gripper close issued")
-                time.sleep(2.0)
-                return False
-            return True
-
         except Exception as e:
-            print (e)
-            return False
+            return False, "An error occured while trying to grasp from pose"
+
+        return True, "Grasped successfully"
+    
+    @try_claim
+    def unified_pickup(self, grasp_response):
+        """can be called after grasp_3d or grasp_in_image
+        Brings arm to carry position and verifies success of the grasp.
+        If grasp was unsuccessful, the arm is stowed."""
+
+        success = True
+        msg = grasp_response[1]
+        if grasp_response[0]:
+            carry = RobotCommandBuilder.arm_carry_command()
+            self._robot_command_client.robot_command(carry)
+            self._logger.info("Command carry issued")
+            time.sleep(2.0)
+
+            self._logger.info('Verifying grasp success')
+            success = self.is_holding()
+            if not success:
+                self._logger.warn("Gripper is empty, grasp unsuccessful, stowing arm")
+                self._robot_command(RobotCommandBuilder.stop_command())
+                msg = "Gripper is empty"
+                time.sleep(1.0)
+                override = manipulation_api_pb2.ApiGraspOverrideRequest()
+                override.api_grasp_override.override_request = manipulation_api_pb2.ApiGraspOverride.Override.OVERRIDE_NOT_HOLDING
+                self._manipulation_client.grasp_override_command(grasp_override_request=override)
+                time.sleep(1.0)
+            else:
+                self._logger.info("Grasp was successful")
+                msg = "Grasped successfully"
+        if not success or not grasp_response[0]:
+            stow = RobotCommandBuilder.arm_stow_command()
+            self._robot_command_client.robot_command(stow)
+            self._logger.info("Stow command issued")
+            time.sleep(2.0)
+            command = RobotCommandBuilder.claw_gripper_close_command()
+            self._robot_command_client.robot_command(command)
+            self._logger.info("Gripper close issued")
+            time.sleep(2.0)
+            return False, msg
+        return True, msg
 
     def is_holding(self):
         """verify if gripper is holding object from load of the finger joint"""
@@ -2012,7 +2013,13 @@ class SpotWrapper:
             print(e)
             return False
 
+    @try_claim
     def arm_gaze(self, point, frame):
+        #TODO: set tool_trajectory_in_frame2 in gaze command to set the position of the arm (the default one is in front of the robot)
+        #  the arm now has difficulty looking at objects close to the robot or at the sides
+        #  https://dev.bostondynamics.com/protos/bosdyn/api/proto_reference.html?highlight=gaze#gazecommand-request
+        #  https://github.com/boston-dynamics/spot-sdk/blob/master/python/examples/arm_gaze/arm_gaze.py#L154
+        
         unstow = RobotCommandBuilder.arm_ready_command()
 
         # Issue the command via the RobotCommandClient
@@ -2028,7 +2035,7 @@ class SpotWrapper:
         self._logger.info("Requesting gaze.")
         gaze_command_id = self._robot_command_client.robot_command(synchro_command)
 
-        block_until_arm_arrives(command_client, gaze_command_id, 4.0)
+        block_until_arm_arrives(self._robot_command_client, gaze_command_id, 4.0)
         return True
 
     ###################################################################
