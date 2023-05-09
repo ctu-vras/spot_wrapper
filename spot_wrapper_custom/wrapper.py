@@ -1908,6 +1908,9 @@ class SpotWrapper:
             self._robot_command_client.robot_command(carry)
             self._logger.info("Command carry issued")
             time.sleep(2.0)
+            self.gripper_close() # after grasp command, gripper is closed with full torque even if empty
+            # calling gripper_close fixes this - if the gripper is empty, torque is close to zero
+            # if the gripper is holding an object, torque stays high
 
             self._logger.info('Verifying grasp success')
             success = self.is_holding()
