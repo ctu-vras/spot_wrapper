@@ -1877,13 +1877,13 @@ class SpotWrapper:
 
             grasp_request = manipulation_api_pb2.ManipulationApiRequest(
                 pick_object_in_image=grasp)
-            response = self._manipulation_api_client.manipulation_api_command(manipulation_api_request=grasp_request)
+            response = self._manipulation_client.manipulation_api_command(manipulation_api_request=grasp_request)
             command_id = response.manipulation_cmd_id
             self._logger.info("Command GraspInImage issued")
             time.sleep(1.0)
             feedback_request = manipulation_api_pb2.ManipulationApiFeedbackRequest(manipulation_cmd_id=command_id)
             while True:
-                feedback_response = self._manipulation_api_client.manipulation_api_feedback_command(feedback_request)
+                feedback_response = self._manipulation_client.manipulation_api_feedback_command(feedback_request)
                 print("Current state: ", manipulation_api_pb2.ManipulationFeedbackState.Name(feedback_response.current_state))
                 if (feedback_response.current_state == manipulation_api_pb2.MANIP_STATE_GRASP_SUCCEEDED or
                 feedback_response.current_state == manipulation_api_pb2.MANIP_STATE_GRASP_FAILED):
