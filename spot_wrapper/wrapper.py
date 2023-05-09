@@ -1916,7 +1916,7 @@ class SpotWrapper:
                 msg = "Gripper is empty"
                 time.sleep(1.0)
                 override = manipulation_api_pb2.ApiGraspOverrideRequest()
-                override.api_grasp_override.override_request = manipulation_api_pb2.ApiGraspOverride.Override.OVERRIDE_NOT_HOLDING
+                override.api_grasp_override.override_request = manipulation_api_pb2.ApiGraspOverride.OVERRIDE_NOT_HOLDING
                 self._manipulation_client.grasp_override_command(grasp_override_request=override)
                 time.sleep(1.0)
             else:
