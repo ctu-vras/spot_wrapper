@@ -2015,11 +2015,48 @@ class SpotWrapper:
 
     @try_claim
     def arm_gaze(self, point, frame):
-        #TODO: set tool_trajectory_in_frame2 in gaze command to set the position of the arm (the default one is in front of the robot)
-        #  the arm now has difficulty looking at objects close to the robot or at the sides
-        #  https://dev.bostondynamics.com/protos/bosdyn/api/proto_reference.html?highlight=gaze#gazecommand-request
-        #  https://github.com/boston-dynamics/spot-sdk/blob/master/python/examples/arm_gaze/arm_gaze.py#L154
-        
+        robot_state = self._robot_state_client.get_robot_state()
+        body_T_frame = frame_helpers.get_a_tform_b(robot_state.kinematic_state.transforms_snapshot,
+                                                  frame_helpers.GRAV_ALIGNED_BODY_FRAME_NAME, frame)
+
+        point_wrt_frame = geometry_pb2.Vec3(x=point[0], y=point[1], z=point[2])
+        point_Q_frame = geometry_pb2.Quaternion(w=0, x=0, y=0, z=1)
+        frame_T_point = geometry_pb2.SE3Pose(position=point_wrt_frame, rotation=point_Q_frame)
+
+        body_T_point = body_T_frame * math_helpers.SE3Pose.from_obj(frame_T_point)
+        p = body_T_point.get_translation()
+
+        # transform the point to arm base and compute angle and distance
+        # arm base is the pivot point of the first joint projected into xy plane of frame body
+        # TODO: it should be projected into flat_body
+        Va = np.array([[1], [0], [0]])
+        Vb = np.array([[p[0]], [p[1]], [0]])-np.array([[0.292], [0], [0]])
+        Vn = np.array([[0], [0], [1]])
+        angle = float(np.arctan2(np.matmul(np.cross(Va, Vb, axis=0).T, Vn), np.matmul(Va.T, Vb)))
+        self._logger.info("Angle to object is %f" % angle)
+        if abs(angle) > 2*np.pi/3:
+            self._logger.warning("The provided point is behind the robot, gaze is not possible")
+            return False
+        dist = np.linalg.norm(Vb)
+        self._logger.info("Distance to object is %f" % dist)
+
+        # select the gaze point with respect to arm base
+        gaze_x = np.clip(dist, 0.3, 0.7)
+        gaze_position = np.array([[gaze_x], [0], [0.3]])
+        s = np.sin(angle)
+        c = np.cos(angle)
+        rot = np.array([[c, -s, 0], [s, c, 0], [0, 0, 1]])
+        gaze_rot = np.matmul(rot, gaze_position)
+        self._logger.info("Selected pose in arm base: %s" % str(gaze_rot))
+
+        # transform it back to body frame
+        gaze_tf = gaze_rot + np.array([[0.292], [0], [0]])
+        self._logger.info("Selected pose in body: %s" % str(gaze_tf))
+
+        gaze_vec = geometry_pb2.Vec3(x=gaze_tf[0], y=gaze_tf[1], z=gaze_tf[2])
+        gaze_quat = geometry_pb2.Quaternion(w=0, x=0, y=0, z=1)
+        gaze_pose = geometry_pb2.SE3Pose(position=gaze_vec, rotation=gaze_quat)
+
         unstow = RobotCommandBuilder.arm_ready_command()
 
         # Issue the command via the RobotCommandClient
@@ -2027,7 +2064,9 @@ class SpotWrapper:
         self._logger.info("Unstow command issued.")
         block_until_arm_arrives(self._robot_command_client, unstow_command_id, 3.0)
 
-        gaze_command = RobotCommandBuilder.arm_gaze_command(point[0],point[1],point[2], frame)
+        gaze_command = RobotCommandBuilder.arm_gaze_command(point[0], point[1], point[2], frame,
+                                                            frame2_tform_desired_hand=gaze_pose,
+                                                            frame2_name=frame_helpers.GRAV_ALIGNED_BODY_FRAME_NAME)
         gripper_command = RobotCommandBuilder.claw_gripper_open_command()
         synchro_command = RobotCommandBuilder.build_synchro_command(gripper_command, gaze_command)
 
