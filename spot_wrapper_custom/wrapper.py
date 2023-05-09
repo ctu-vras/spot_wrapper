@@ -5,6 +5,7 @@ import time
 import traceback
 import typing
 from collections import namedtuple
+import numpy as np
 
 import bosdyn.client.auth
 from bosdyn.api import arm_command_pb2
@@ -1911,7 +1912,7 @@ class SpotWrapper:
             self._logger.info('Verifying grasp success')
             success = self.is_holding()
             if not success:
-                self._logger.warn("Gripper is empty, grasp unsuccessful, stowing arm")
+                self._logger.warning("Gripper is empty, grasp unsuccessful, stowing arm")
                 self._robot_command(RobotCommandBuilder.stop_command())
                 msg = "Gripper is empty"
                 time.sleep(1.0)
@@ -2003,7 +2004,7 @@ class SpotWrapper:
                     break
                 if feedback_resp.feedback.synchronized_feedback.arm_command_feedback.arm_cartesian_feedback.status ==\
                         arm_command_pb2.ArmCartesianCommand.Feedback.STATUS_TRAJECTORY_STALLED:
-                    self._logger.warn('Robot stalled, stop command issued. Trajectory point is unreachable')
+                    self._logger.warning('Robot stalled, stop command issued. Trajectory point is unreachable')
                     self._robot_command(RobotCommandBuilder.stop_command())
                     break
                 time.sleep(0.1)
