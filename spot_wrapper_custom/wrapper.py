@@ -118,6 +118,22 @@ ImageWithHandBundle = namedtuple(
     "ImageBundle", ["frontleft", "frontright", "left", "right", "back", "hand"]
 )
 
+"""List of manipulation states for grasping"""
+GRASP_FAIL = [manipulation_api_pb2.MANIP_STATE_GRASP_FAILED,
+    manipulation_api_pb2.MANIP_STATE_GRASP_PLANNING_NO_SOLUTION,
+    manipulation_api_pb2.MANIP_STATE_PLACE_FAILED_TO_RAYCAST_INTO_MAP,
+    manipulation_api_pb2.MANIP_STATE_GRASP_FAILED_TO_RAYCAST_INTO_MAP,
+    manipulation_api_pb2.MANIP_STATE_PLACE_FAILED]
+
+GRASP_BREAK = [manipulation_api_pb2.MANIP_STATE_GRASP_FAILED,
+    manipulation_api_pb2.MANIP_STATE_GRASP_PLANNING_NO_SOLUTION,
+    manipulation_api_pb2.MANIP_STATE_PLACE_FAILED_TO_RAYCAST_INTO_MAP,
+    manipulation_api_pb2.MANIP_STATE_GRASP_FAILED_TO_RAYCAST_INTO_MAP,
+    manipulation_api_pb2.MANIP_STATE_PLACE_FAILED,
+    manipulation_api_pb2.MANIP_STATE_DONE,
+    manipulation_api_pb2.MANIP_STATE_GRASP_SUCCEEDED,
+    manipulation_api_pb2.MANIP_STATE_PLACE_SUCCEEDED]
+
 
 class AsyncRobotState(AsyncPeriodicQuery):
     """Class to get robot state at regular intervals.  get_robot_state_async query sent to the robot at every tick.  Callback registered to defined callback function.
@@ -1802,7 +1818,9 @@ class SpotWrapper:
                 manipulation_api_request=grasp_request
             )
 
+            success = True
             # Get feedback from the robot
+            t0 = time.time()
             while True:
                 feedback_request = manipulation_api_pb2.ManipulationApiFeedbackRequest(
                     manipulation_cmd_id=cmd_response.manipulation_cmd_id
@@ -1820,12 +1838,27 @@ class SpotWrapper:
                     ),
                 )
 
-                if (
-                    response.current_state
-                    == manipulation_api_pb2.MANIP_STATE_GRASP_SUCCEEDED
-                    or response.current_state
-                    == manipulation_api_pb2.MANIP_STATE_GRASP_FAILED
-                ):
+                # if (
+                #     response.current_state
+                #     == manipulation_api_pb2.MANIP_STATE_GRASP_SUCCEEDED
+                #     or response.current_state
+                #     == manipulation_api_pb2.MANIP_STATE_GRASP_FAILED
+                # ):
+                #     break
+                msg = "Grasped successfully"
+                if response.current_state in GRASP_FAIL:
+                    msg = "An error occured [" + manipulation_api_pb2.ManipulationFeedbackState.Name(response.current_state) + "]"
+                    success = False
+                    self.recover_failed_grasp()
+                if response.current_state in GRASP_BREAK:
+                    break
+
+                t1 = time.time()
+                if t1-t0 > 90:
+                    self._logger.warn('Grasp command timed out')
+                    success = False
+                    msg = 'Grasp command timed out'
+                    self.recover_failed_grasp()
                     break
 
                 time.sleep(0.25)
@@ -1835,7 +1868,7 @@ class SpotWrapper:
         except Exception as e:
             return False, "An error occured while trying to grasp from pose"
 
-        return True, "Grasped successfully"
+        return success, msg
 
     ###################################################################
 
@@ -1882,18 +1915,48 @@ class SpotWrapper:
             self._logger.info("Command GraspInImage issued")
             time.sleep(1.0)
             feedback_request = manipulation_api_pb2.ManipulationApiFeedbackRequest(manipulation_cmd_id=command_id)
+            success = True
+            t0 = time.time()
             while True:
                 feedback_response = self._manipulation_client.manipulation_api_feedback_command(feedback_request)
                 print("Current state: ", manipulation_api_pb2.ManipulationFeedbackState.Name(feedback_response.current_state))
-                if (feedback_response.current_state == manipulation_api_pb2.MANIP_STATE_GRASP_SUCCEEDED or
-                feedback_response.current_state == manipulation_api_pb2.MANIP_STATE_GRASP_FAILED):
+                #if (feedback_response.current_state == manipulation_api_pb2.MANIP_STATE_GRASP_SUCCEEDED or
+                #feedback_response.current_state == manipulation_api_pb2.MANIP_STATE_GRASP_FAILED):
+                msg = "Grasped successfully"
+                if response.current_state in GRASP_FAIL:
+                    msg = "An error occured [" + manipulation_api_pb2.ManipulationFeedbackState.Name(response.current_state) + "]"
+                    success = False
+                    self.recover_failed_grasp()
+                if response.current_state in GRASP_BREAK:
                     break
-                time.sleep(0.5)
+                t1 = time.time()
+                if t1-t0 > 90:
+                    self._logger.warn('Grasp command timed out')
+                    success = False
+                    msg = 'Grasp command timed out'
+                    self.recover_failed_grasp()
+                    break
+                time.sleep(0.25)
 
         except Exception as e:
             return False, "An error occured while trying to grasp from pose"
 
-        return True, "Grasped successfully"
+        return True, msg
+
+    @try_claim
+    def recover_failed_grasp(self):
+        """stop the robot, empty gripper, stow arm, close gripper"""
+        self._logger.warning("Error occured during pickup, stopping motion")
+        self._robot_command(RobotCommandBuilder.stop_command())
+
+        self. gripper_open()
+
+        stow = RobotCommandBuilder.arm_stow_command()
+        self._robot_command_client.robot_command(stow)
+        self._logger.info("Command stow issued")
+        time.sleep(2.0)
+
+        self.gripper_close()
     
     @try_claim
     def unified_pickup(self, grasp_response):
@@ -2038,7 +2101,7 @@ class SpotWrapper:
         Vn = np.array([[0], [0], [1]])
         angle = float(np.arctan2(np.matmul(np.cross(Va, Vb, axis=0).T, Vn), np.matmul(Va.T, Vb)))
         self._logger.info("Angle to object is %f" % angle)
-        if abs(angle) > 2*np.pi/3:
+        if abs(angle) > 2*np.deg2rad(160):
             self._logger.warning("The provided point is behind the robot, gaze is not possible")
             return False
         dist = np.linalg.norm(Vb)
