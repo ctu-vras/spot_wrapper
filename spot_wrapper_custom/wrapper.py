@@ -2045,8 +2045,8 @@ class SpotWrapper:
         self._logger.info("Distance to object is %f" % dist)
 
         # select the gaze point with respect to arm base
-        gaze_x = np.clip(dist, 0.3, 0.7)
-        gaze_position = np.array([[gaze_x], [0], [0.3]])
+        gaze_x = np.clip(dist, 0.2, 0.5)
+        gaze_position = np.array([[gaze_x], [0], [0.2]])
         s = np.sin(angle)
         c = np.cos(angle)
         rot = np.array([[c, -s, 0], [s, c, 0], [0, 0, 1]])
