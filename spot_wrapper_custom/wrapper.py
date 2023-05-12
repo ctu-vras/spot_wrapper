@@ -1941,7 +1941,7 @@ class SpotWrapper:
         except Exception as e:
             return False, "An error occured while trying to grasp from pose"
 
-        return True, msg
+        return success, msg
 
     @try_claim
     def recover_failed_grasp(self):
