@@ -48,6 +48,7 @@ from bosdyn.client.world_object import WorldObjectClient
 from bosdyn.geometry import EulerZXY
 from bosdyn.util import seconds_to_duration
 from google.protobuf.duration_pb2 import Duration
+from bosdyn.client.local_grid import LocalGridClient
 
 MAX_COMMAND_DURATION = 1e5
 
@@ -463,6 +464,32 @@ class AsyncWorldObjects(AsyncPeriodicQuery):
             return callback_future
 
 
+class AsyncGridService(AsyncPeriodicQuery):
+    """Class to get local grid at regular intervals.
+
+    Attributes:
+        client: The Client to a service on the robot
+        logger: Logger object
+        rate: Rate (Hz) to trigger the query
+        callback: Callback function to call when the results of the query are available
+    """
+
+    def __init__(self, client, logger, rate, callback, grid_names):
+        super(AsyncGridService, self).__init__(
+            "local-grid-service", client, logger, period_sec=1.0 / max(rate, 1.0)
+        )
+        self._callback = None
+        if rate > 0.0:
+            self._callback = callback
+        self._grid_names = grid_names
+
+    def _start_query(self):
+        if self._callback:
+            callback_future = self._client.get_local_grids_async(self._grid_names)
+            callback_future.add_done_callback(self._callback)
+            return callback_future
+
+
 def try_claim(func=None, *, power_on=False):
     """
     Decorator which tries to acquire the lease before executing the wrapped function
@@ -629,6 +656,8 @@ class SpotWrapper:
                 )
             )
 
+        self._grid_names = ['no_step']
+
         try:
             self._sdk = create_standard_sdk(self.SPOT_CLIENT_NAME)
         except Exception as e:
@@ -706,6 +735,11 @@ class SpotWrapper:
                         self._manipulation_client = self._robot.ensure_client(
                             ManipulationApiClient.default_service_name
                         )
+
+                    self._grid_client = self._robot.ensure_client(
+                        LocalGridClient.default_service_name
+                    )
+
                     initialised = True
                 except Exception as e:
                     sleep_secs = 15
@@ -809,6 +843,10 @@ class SpotWrapper:
                 self._callbacks.get("world_objects", None),
             )
 
+            self._local_grid_task = AsyncGridService(
+                self._grid_client, self._logger, 10.0, self._callbacks.get("local_grid", None), self._grid_names,
+            )
+
             self._estop_endpoint = None
             self._estop_keepalive = None
 
@@ -820,6 +858,7 @@ class SpotWrapper:
                 self._idle_task,
                 self._estop_monitor,
                 self._world_objects_task,
+                self._local_grid_task,
             ]
 
             if self._point_cloud_client:
@@ -934,6 +973,11 @@ class SpotWrapper:
     @property
     def at_goal(self):
         return self._at_goal
+    
+    @property
+    def local_grids(self):
+        """Return latest proto from the _local_grid_task"""
+        return self._local_grid_task.proto
 
     def is_estopped(self, timeout=None):
         return self._robot.is_estopped(timeout=timeout)
