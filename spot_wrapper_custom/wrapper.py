@@ -2145,7 +2145,7 @@ class SpotWrapper:
         Vn = np.array([[0], [0], [1]])
         angle = float(np.arctan2(np.matmul(np.cross(Va, Vb, axis=0).T, Vn), np.matmul(Va.T, Vb)))
         self._logger.info("Angle to object is %f" % angle)
-        if abs(angle) > 2*np.deg2rad(160):
+        if abs(angle) > np.deg2rad(130):
             self._logger.warning("The provided point is behind the robot, gaze is not possible")
             return False
         dist = np.linalg.norm(Vb)
