@@ -1898,7 +1898,7 @@ class SpotWrapper:
                     break
 
                 t1 = time.time()
-                if t1-t0 > 90:
+                if t1-t0 > 20:
                     self._logger.warn('Grasp command timed out')
                     success = False
                     msg = 'Grasp command timed out'
@@ -1974,7 +1974,7 @@ class SpotWrapper:
                 if response.current_state in GRASP_BREAK:
                     break
                 t1 = time.time()
-                if t1-t0 > 90:
+                if t1-t0 > 20:
                     self._logger.warn('Grasp command timed out')
                     success = False
                     msg = 'Grasp command timed out'
