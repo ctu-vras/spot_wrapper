@@ -2116,7 +2116,7 @@ class SpotWrapper:
                         arm_command_pb2.ArmCartesianCommand.Feedback.STATUS_TRAJECTORY_STALLED:
                     self._logger.warning('Robot stalled, stop command issued. Trajectory point is unreachable')
                     self._robot_command(RobotCommandBuilder.stop_command())
-                    break
+                    return False
                 time.sleep(0.1)
             return True
 
