@@ -1882,14 +1882,8 @@ class SpotWrapper:
                     ),
                 )
 
-                # if (
-                #     response.current_state
-                #     == manipulation_api_pb2.MANIP_STATE_GRASP_SUCCEEDED
-                #     or response.current_state
-                #     == manipulation_api_pb2.MANIP_STATE_GRASP_FAILED
-                # ):
-                #     break
                 msg = "Grasped successfully"
+                # check the reported state
                 if response.current_state in GRASP_FAIL:
                     msg = "An error occured [" + manipulation_api_pb2.ManipulationFeedbackState.Name(response.current_state) + "]"
                     success = False
@@ -1897,6 +1891,8 @@ class SpotWrapper:
                 if response.current_state in GRASP_BREAK:
                     break
 
+                # robot could get stuck in one of the phases without advancing to completition
+                # if the command takes too long, cancel it and report failure
                 t1 = time.time()
                 if t1-t0 > 20:
                     self._logger.warn('Grasp command timed out')
@@ -1931,11 +1927,13 @@ class SpotWrapper:
             self._logger.info("Command stow issued")
             time.sleep(2.0)
             source = camera
-
+            
+            # request image
             image_request = [build_image_request(source, image_format=image_pb2.Image.FORMAT_RAW)]
             image_responses = self._image_client.get_image(image_request)
             image = image_responses[0]
 
+            # build the grasp request
             pick_vec = geometry_pb2.Vec2(x=coord[0], y=coord[1])
             grasp = manipulation_api_pb2.PickObjectInImage(
                 pixel_xy=pick_vec,
@@ -1962,10 +1960,11 @@ class SpotWrapper:
             success = True
             t0 = time.time()
             while True:
+                # request feedback
                 response = self._manipulation_client.manipulation_api_feedback_command(feedback_request)
                 print("Current state: ", manipulation_api_pb2.ManipulationFeedbackState.Name(response.current_state))
-                #if (feedback_response.current_state == manipulation_api_pb2.MANIP_STATE_GRASP_SUCCEEDED or
-                #feedback_response.current_state == manipulation_api_pb2.MANIP_STATE_GRASP_FAILED):
+                
+                # check for failures
                 msg = "Grasped successfully"
                 if response.current_state in GRASP_FAIL:
                     msg = "An error occured [" + manipulation_api_pb2.ManipulationFeedbackState.Name(response.current_state) + "]"
@@ -1973,6 +1972,9 @@ class SpotWrapper:
                     self.recover_failed_grasp()
                 if response.current_state in GRASP_BREAK:
                     break
+                
+                # robot could get stuck in one of the phases without advancing to completition
+                # if the command takes too long, cancel it and report failure
                 t1 = time.time()
                 if t1-t0 > 20:
                     self._logger.warn('Grasp command timed out')
@@ -2020,7 +2022,7 @@ class SpotWrapper:
             # if the gripper is holding an object, torque stays high
 
             self._logger.info('Verifying grasp success')
-            success = self.is_holding()
+            success = self.is_holding()  # check if gripper is empty
             if not success:
                 self._logger.warning("Gripper is empty, grasp unsuccessful, stowing arm")
                 self._robot_command(RobotCommandBuilder.stop_command())
@@ -2034,6 +2036,7 @@ class SpotWrapper:
                 self._logger.info("Grasp was successful")
                 msg = "Grasped successfully"
         if not success or not grasp_response[0]:
+            # autonomous grasp failed or the gripper is empty
             stow = RobotCommandBuilder.arm_stow_command()
             self._robot_command_client.robot_command(stow)
             self._logger.info("Stow command issued")
@@ -2049,13 +2052,14 @@ class SpotWrapper:
         """verify if gripper is holding object from load of the finger joint"""
         fgr_load = 0
         for i in range(3):
+            # read load at the gripper finger
             st = self._robot_state_client.get_robot_state()
             joints = st.kinematic_state.joint_states
             for joint in joints:
                 if joint.name == 'arm0.f1x':
                     fgr_load += joint.load.value
             time.sleep(0.1)
-        fgr_load = fgr_load/3.
+        fgr_load = fgr_load/3. #compute average
         self._logger.info("Gripper load is %.3f" % (fgr_load))
         return fgr_load > 0.5
 
@@ -2085,8 +2089,10 @@ class SpotWrapper:
                 odom_T_root = frame_helpers.get_a_tform_b(robot_state.kinematic_state.transforms_snapshot,
                                             frame_helpers.GRAV_ALIGNED_BODY_FRAME_NAME, root_frame)
 
+                # transform the pose into flat_body frame
                 odom_T_hand = odom_T_root * math_helpers.SE3Pose.from_obj(root_T_hand)
 
+                # add the point to the trajectory
                 traj_point = trajectory_pb2.SE3TrajectoryPoint(
                     pose=odom_T_hand.to_proto(), time_since_reference=seconds_to_duration(point_time))
                 point_time += time_increment
@@ -2094,6 +2100,7 @@ class SpotWrapper:
 
             hand_traj = trajectory_pb2.SE3Trajectory(points=points)
 
+            # send the trajectory command
             arm_cartesian_command = arm_command_pb2.ArmCartesianCommand.Request(
                 pose_trajectory_in_task=hand_traj, root_frame_name=frame_helpers.GRAV_ALIGNED_BODY_FRAME_NAME)
             arm_command = arm_command_pb2.ArmCommand.Request(arm_cartesian_command=arm_cartesian_command)
@@ -2110,10 +2117,12 @@ class SpotWrapper:
 
                 if feedback_resp.feedback.synchronized_feedback.arm_command_feedback.arm_cartesian_feedback.status ==\
                         arm_command_pb2.ArmCartesianCommand.Feedback.STATUS_TRAJECTORY_COMPLETE:
+                    # goal reached
                     self._logger.info('Move complete.')
                     break
                 if feedback_resp.feedback.synchronized_feedback.arm_command_feedback.arm_cartesian_feedback.status ==\
                         arm_command_pb2.ArmCartesianCommand.Feedback.STATUS_TRAJECTORY_STALLED:
+                    # the arm stopped moving towards the goal
                     self._logger.warning('Robot stalled, stop command issued. Trajectory point is unreachable')
                     self._robot_command(RobotCommandBuilder.stop_command())
                     return False
@@ -2126,6 +2135,7 @@ class SpotWrapper:
 
     @try_claim
     def arm_gaze(self, point, frame):
+        """set gaze of the gripper camera"""
         robot_state = self._robot_state_client.get_robot_state()
         body_T_frame = frame_helpers.get_a_tform_b(robot_state.kinematic_state.transforms_snapshot,
                                                   frame_helpers.GRAV_ALIGNED_BODY_FRAME_NAME, frame)
@@ -2134,12 +2144,12 @@ class SpotWrapper:
         point_Q_frame = geometry_pb2.Quaternion(w=0, x=0, y=0, z=1)
         frame_T_point = geometry_pb2.SE3Pose(position=point_wrt_frame, rotation=point_Q_frame)
 
+        # transform the point into flat_body frame
         body_T_point = body_T_frame * math_helpers.SE3Pose.from_obj(frame_T_point)
         p = body_T_point.get_translation()
 
-        # transform the point to arm base and compute angle and distance
+        # transform the point to arm base and compute oriented angle and distance
         # arm base is the pivot point of the first joint projected into xy plane of frame body
-        # TODO: it should be projected into flat_body
         Va = np.array([[1], [0], [0]])
         Vb = np.array([[p[0]], [p[1]], [0]])-np.array([[0.292], [0], [0]])
         Vn = np.array([[0], [0], [1]])
@@ -2152,7 +2162,7 @@ class SpotWrapper:
         self._logger.info("Distance to object is %f" % dist)
 
         # select the gaze point with respect to arm base
-        gaze_x = np.clip(dist, 0.2, 0.5)
+        gaze_x = np.clip(dist, 0.2, 0.5)  # limit the reach
         gaze_position = np.array([[gaze_x], [0], [0.2]])
         s = np.sin(angle)
         c = np.cos(angle)
