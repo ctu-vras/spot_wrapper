@@ -2017,7 +2017,7 @@ class SpotWrapper:
             carry = RobotCommandBuilder.arm_carry_command()
             self._robot_command_client.robot_command(carry)
             self._logger.info("Command carry issued")
-            time.sleep(2.0)
+            time.sleep(1.0)
             self.gripper_close() # after grasp command, gripper is closed with full torque even if empty
             # calling gripper_close fixes this - if the gripper is empty, torque is close to zero
             # if the gripper is holding an object, torque stays high
@@ -2028,11 +2028,11 @@ class SpotWrapper:
                 self._logger.warning("Gripper is empty, grasp unsuccessful, stowing arm")
                 self._robot_command(RobotCommandBuilder.stop_command())
                 msg = "Gripper is empty"
-                time.sleep(1.0)
+                time.sleep(0.5)
                 override = manipulation_api_pb2.ApiGraspOverrideRequest()
                 override.api_grasp_override.override_request = manipulation_api_pb2.ApiGraspOverride.OVERRIDE_NOT_HOLDING
                 self._manipulation_client.grasp_override_command(grasp_override_request=override)
-                time.sleep(1.0)
+                time.sleep(0.5)
             else:
                 self._logger.info("Grasp was successful")
                 msg = "Grasped successfully"
@@ -2041,11 +2041,11 @@ class SpotWrapper:
             stow = RobotCommandBuilder.arm_stow_command()
             self._robot_command_client.robot_command(stow)
             self._logger.info("Stow command issued")
-            time.sleep(2.0)
+            time.sleep(1.0)
             command = RobotCommandBuilder.claw_gripper_close_command()
             self._robot_command_client.robot_command(command)
             self._logger.info("Gripper close issued")
-            time.sleep(2.0)
+            time.sleep(0.5)
             return False, msg
         return True, msg
 
