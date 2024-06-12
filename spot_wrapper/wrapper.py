@@ -5,6 +5,7 @@ import time
 import traceback
 import typing
 from collections import namedtuple
+import numpy as np
 
 import bosdyn.client.auth
 from bosdyn.api import arm_command_pb2
@@ -41,12 +42,13 @@ from bosdyn.client.lease import LeaseClient, LeaseKeepAlive
 from bosdyn.client.manipulation_api_client import ManipulationApiClient
 from bosdyn.client.point_cloud import build_pc_request
 from bosdyn.client.power import safe_power_off, PowerClient, power_on
-from bosdyn.client.robot_command import RobotCommandClient, RobotCommandBuilder
+from bosdyn.client.robot_command import RobotCommandClient, RobotCommandBuilder, block_until_arm_arrives
 from bosdyn.client.robot_state import RobotStateClient
 from bosdyn.client.world_object import WorldObjectClient
 from bosdyn.geometry import EulerZXY
 from bosdyn.util import seconds_to_duration
 from google.protobuf.duration_pb2 import Duration
+from bosdyn.client.local_grid import LocalGridClient
 
 MAX_COMMAND_DURATION = 1e5
 
@@ -116,6 +118,22 @@ ImageBundle = namedtuple(
 ImageWithHandBundle = namedtuple(
     "ImageBundle", ["frontleft", "frontright", "left", "right", "back", "hand"]
 )
+
+"""List of manipulation states for grasping"""
+GRASP_FAIL = [manipulation_api_pb2.MANIP_STATE_GRASP_FAILED,
+    manipulation_api_pb2.MANIP_STATE_GRASP_PLANNING_NO_SOLUTION,
+    manipulation_api_pb2.MANIP_STATE_PLACE_FAILED_TO_RAYCAST_INTO_MAP,
+    manipulation_api_pb2.MANIP_STATE_GRASP_FAILED_TO_RAYCAST_INTO_MAP,
+    manipulation_api_pb2.MANIP_STATE_PLACE_FAILED]
+
+GRASP_BREAK = [manipulation_api_pb2.MANIP_STATE_GRASP_FAILED,
+    manipulation_api_pb2.MANIP_STATE_GRASP_PLANNING_NO_SOLUTION,
+    manipulation_api_pb2.MANIP_STATE_PLACE_FAILED_TO_RAYCAST_INTO_MAP,
+    manipulation_api_pb2.MANIP_STATE_GRASP_FAILED_TO_RAYCAST_INTO_MAP,
+    manipulation_api_pb2.MANIP_STATE_PLACE_FAILED,
+    manipulation_api_pb2.MANIP_STATE_DONE,
+    manipulation_api_pb2.MANIP_STATE_GRASP_SUCCEEDED,
+    manipulation_api_pb2.MANIP_STATE_PLACE_SUCCEEDED]
 
 
 class AsyncRobotState(AsyncPeriodicQuery):
@@ -446,6 +464,32 @@ class AsyncWorldObjects(AsyncPeriodicQuery):
             return callback_future
 
 
+class AsyncGridService(AsyncPeriodicQuery):
+    """Class to get local grid at regular intervals.
+
+    Attributes:
+        client: The Client to a service on the robot
+        logger: Logger object
+        rate: Rate (Hz) to trigger the query
+        callback: Callback function to call when the results of the query are available
+    """
+
+    def __init__(self, client, logger, rate, callback, grid_names):
+        super(AsyncGridService, self).__init__(
+            "local-grid-service", client, logger, period_sec=1.0 / max(rate, 1.0)
+        )
+        self._callback = None
+        if rate > 0.0:
+            self._callback = callback
+        self._grid_names = grid_names
+
+    def _start_query(self):
+        if self._callback:
+            callback_future = self._client.get_local_grids_async(self._grid_names)
+            callback_future.add_done_callback(self._callback)
+            return callback_future
+
+
 def try_claim(func=None, *, power_on=False):
     """
     Decorator which tries to acquire the lease before executing the wrapped function
@@ -612,6 +656,8 @@ class SpotWrapper:
                 )
             )
 
+        self._grid_names = ['no_step']
+
         try:
             self._sdk = create_standard_sdk(self.SPOT_CLIENT_NAME)
         except Exception as e:
@@ -689,6 +735,11 @@ class SpotWrapper:
                         self._manipulation_client = self._robot.ensure_client(
                             ManipulationApiClient.default_service_name
                         )
+
+                    self._grid_client = self._robot.ensure_client(
+                        LocalGridClient.default_service_name
+                    )
+
                     initialised = True
                 except Exception as e:
                     sleep_secs = 15
@@ -792,6 +843,10 @@ class SpotWrapper:
                 self._callbacks.get("world_objects", None),
             )
 
+            self._local_grid_task = AsyncGridService(
+                self._grid_client, self._logger, 10.0, self._callbacks.get("local_grid", None), self._grid_names,
+            )
+
             self._estop_endpoint = None
             self._estop_keepalive = None
 
@@ -803,6 +858,7 @@ class SpotWrapper:
                 self._idle_task,
                 self._estop_monitor,
                 self._world_objects_task,
+                self._local_grid_task,
             ]
 
             if self._point_cloud_client:
@@ -917,6 +973,11 @@ class SpotWrapper:
     @property
     def at_goal(self):
         return self._at_goal
+    
+    @property
+    def local_grids(self):
+        """Return latest proto from the _local_grid_task"""
+        return self._local_grid_task.proto
 
     def is_estopped(self, timeout=None):
         return self._robot.is_estopped(timeout=timeout)
@@ -962,12 +1023,13 @@ class SpotWrapper:
 
     def claim(self):
         """Get a lease for the robot, a handle on the estop endpoint, and the ID of the robot."""
-        for resource in self.lease:
-            if (
-                resource.resource == "all-leases"
-                and self.SPOT_CLIENT_NAME in resource.lease_owner.client_name
-            ):
-                return True, "We already claimed the lease"
+        if self.lease is not None:
+            for resource in self.lease:
+                if (
+                    resource.resource == "all-leases"
+                    and self.SPOT_CLIENT_NAME in resource.lease_owner.client_name
+                ):
+                    return True, "We already claimed the lease"
 
         try:
             self._robot_id = self._robot.get_id()
@@ -1801,7 +1863,9 @@ class SpotWrapper:
                 manipulation_api_request=grasp_request
             )
 
+            success = True
             # Get feedback from the robot
+            t0 = time.time()
             while True:
                 feedback_request = manipulation_api_pb2.ManipulationApiFeedbackRequest(
                     manipulation_cmd_id=cmd_response.manipulation_cmd_id
@@ -1819,12 +1883,23 @@ class SpotWrapper:
                     ),
                 )
 
-                if (
-                    response.current_state
-                    == manipulation_api_pb2.MANIP_STATE_GRASP_SUCCEEDED
-                    or response.current_state
-                    == manipulation_api_pb2.MANIP_STATE_GRASP_FAILED
-                ):
+                msg = "Grasped successfully"
+                # check the reported state
+                if response.current_state in GRASP_FAIL:
+                    msg = "An error occured [" + manipulation_api_pb2.ManipulationFeedbackState.Name(response.current_state) + "]"
+                    success = False
+                    self.recover_failed_grasp()
+                if response.current_state in GRASP_BREAK:
+                    break
+
+                # robot could get stuck in one of the phases without advancing to completition
+                # if the command takes too long, cancel it and report failure
+                t1 = time.time()
+                if t1-t0 > 20:
+                    self._logger.warn('Grasp command timed out')
+                    success = False
+                    msg = 'Grasp command timed out'
+                    self.recover_failed_grasp()
                     break
 
                 time.sleep(0.25)
@@ -1834,7 +1909,295 @@ class SpotWrapper:
         except Exception as e:
             return False, "An error occured while trying to grasp from pose"
 
-        return True, "Grasped successfully"
+        return success, msg
+
+    ###################################################################
+
+    # Arm-custom ######################################################
+
+    @try_claim
+    def grasp_in_image(self, camera, coord):
+        """grasp object at xy coordinates in camera image
+        it is expected, that the robot is already powered on and standing"""
+        try:
+            # Stow Arm
+            stow = RobotCommandBuilder.arm_stow_command()
+
+            # Command issue with RobotCommandClient
+            self._robot_command_client.robot_command(stow)
+            self._logger.info("Command stow issued")
+            time.sleep(2.0)
+            source = camera
+            
+            # request image
+            image_request = [build_image_request(source, image_format=image_pb2.Image.FORMAT_RAW)]
+            image_responses = self._image_client.get_image(image_request)
+            image = image_responses[0]
+
+            # build the grasp request
+            pick_vec = geometry_pb2.Vec2(x=coord[0], y=coord[1])
+            grasp = manipulation_api_pb2.PickObjectInImage(
+                pixel_xy=pick_vec,
+                transforms_snapshot_for_camera=image.shot.transforms_snapshot,
+                frame_name_image_sensor=image.shot.frame_name_image_sensor,
+                camera_model=image.source.pinhole)
+
+            gripper_align = geometry_pb2.Vec3(x=1, y=0, z=0)
+            vertical_align = geometry_pb2.Vec3(x=0, y=0, z=-1)
+            constraint = grasp.grasp_params.allowable_orientation.add()
+            constraint.vector_alignment_with_tolerance.axis_on_gripper_ewrt_gripper.CopyFrom(gripper_align)
+            constraint.vector_alignment_with_tolerance.axis_to_align_with_ewrt_frame.CopyFrom(vertical_align)
+            constraint.vector_alignment_with_tolerance.threshold_radians = 0.1*3.14
+            grasp.grasp_params.grasp_params_frame_name = frame_helpers.VISION_FRAME_NAME
+            grasp.grasp_params.grasp_palm_to_fingertip = 0.75
+
+            grasp_request = manipulation_api_pb2.ManipulationApiRequest(
+                pick_object_in_image=grasp)
+            response = self._manipulation_client.manipulation_api_command(manipulation_api_request=grasp_request)
+            command_id = response.manipulation_cmd_id
+            self._logger.info("Command GraspInImage issued")
+            time.sleep(1.0)
+            feedback_request = manipulation_api_pb2.ManipulationApiFeedbackRequest(manipulation_cmd_id=command_id)
+            success = True
+            t0 = time.time()
+            while True:
+                # request feedback
+                response = self._manipulation_client.manipulation_api_feedback_command(feedback_request)
+                print("Current state: ", manipulation_api_pb2.ManipulationFeedbackState.Name(response.current_state))
+                
+                # check for failures
+                msg = "Grasped successfully"
+                if response.current_state in GRASP_FAIL:
+                    msg = "An error occured [" + manipulation_api_pb2.ManipulationFeedbackState.Name(response.current_state) + "]"
+                    success = False
+                    self.recover_failed_grasp()
+                if response.current_state in GRASP_BREAK:
+                    break
+                
+                # robot could get stuck in one of the phases without advancing to completition
+                # if the command takes too long, cancel it and report failure
+                t1 = time.time()
+                if t1-t0 > 20:
+                    self._logger.warn('Grasp command timed out')
+                    success = False
+                    msg = 'Grasp command timed out'
+                    self.recover_failed_grasp()
+                    break
+                time.sleep(0.25)
+
+        except Exception as e:
+            return False, "An error occured while trying to grasp from pose"
+
+        return success, msg
+
+    @try_claim
+    def recover_failed_grasp(self):
+        """stop the robot, empty gripper, stow arm, close gripper"""
+        self._logger.warning("Error occured during pickup, stopping motion")
+        self._robot_command(RobotCommandBuilder.stop_command())
+
+        self. gripper_open()
+
+        stow = RobotCommandBuilder.arm_stow_command()
+        self._robot_command_client.robot_command(stow)
+        self._logger.info("Command stow issued")
+        time.sleep(2.0)
+
+        self.gripper_close()
+    
+    @try_claim
+    def unified_pickup(self, grasp_response):
+        """can be called after grasp_3d or grasp_in_image
+        Brings arm to carry position and verifies success of the grasp.
+        If grasp was unsuccessful, the arm is stowed."""
+
+        success = True
+        msg = grasp_response[1]
+        if grasp_response[0]:
+            carry = RobotCommandBuilder.arm_carry_command()
+            self._robot_command_client.robot_command(carry)
+            self._logger.info("Command carry issued")
+            time.sleep(1.0)
+            self.gripper_close() # after grasp command, gripper is closed with full torque even if empty
+            # calling gripper_close fixes this - if the gripper is empty, torque is close to zero
+            # if the gripper is holding an object, torque stays high
+
+            self._logger.info('Verifying grasp success')
+            success = self.is_holding()  # check if gripper is empty
+            if not success:
+                self._logger.warning("Gripper is empty, grasp unsuccessful, stowing arm")
+                self._robot_command(RobotCommandBuilder.stop_command())
+                msg = "Gripper is empty"
+                time.sleep(0.5)
+                override = manipulation_api_pb2.ApiGraspOverrideRequest()
+                override.api_grasp_override.override_request = manipulation_api_pb2.ApiGraspOverride.OVERRIDE_NOT_HOLDING
+                self._manipulation_client.grasp_override_command(grasp_override_request=override)
+                time.sleep(0.5)
+            else:
+                self._logger.info("Grasp was successful")
+                msg = "Grasped successfully"
+        if not success or not grasp_response[0]:
+            # autonomous grasp failed or the gripper is empty
+            stow = RobotCommandBuilder.arm_stow_command()
+            self._robot_command_client.robot_command(stow)
+            self._logger.info("Stow command issued")
+            time.sleep(1.0)
+            command = RobotCommandBuilder.claw_gripper_close_command()
+            self._robot_command_client.robot_command(command)
+            self._logger.info("Gripper close issued")
+            time.sleep(0.5)
+            return False, msg
+        return True, msg
+
+    def is_holding(self):
+        """verify if gripper is holding object from load of the finger joint"""
+        fgr_load = 0
+        for i in range(3):
+            # read load at the gripper finger
+            st = self._robot_state_client.get_robot_state()
+            joints = st.kinematic_state.joint_states
+            for joint in joints:
+                if joint.name == 'arm0.f1x':
+                    fgr_load += joint.load.value
+            time.sleep(0.1)
+        fgr_load = fgr_load/3. #compute average
+        self._logger.info("Gripper load is %.3f" % (fgr_load))
+        return fgr_load > 0.5
+
+    @try_claim
+    def cartesian_trajectory(self, root_frame, traj_time, poses):
+        """move arm (hand frame) along the given trajectory in the given frame"""
+        points = []
+        time_increment = traj_time/len(poses)
+        point_time = 0
+        try:
+            for pose in poses:
+                x = pose[0][0]
+                y = pose[0][1]
+                z = pose[0][2]
+                hand_ewrt_root = geometry_pb2.Vec3(x=x, y=y, z=z)
+
+                # Rotation as a quaternion
+                qw = pose[1][3]
+                qx = pose[1][0]
+                qy = pose[1][1]
+                qz = pose[1][2]
+                root_Q_hand = geometry_pb2.Quaternion(w=qw, x=qx, y=qy, z=qz)
+
+                root_T_hand = geometry_pb2.SE3Pose(position=hand_ewrt_root, rotation=root_Q_hand)
+
+                robot_state = self._robot_state_client.get_robot_state()
+                odom_T_root = frame_helpers.get_a_tform_b(robot_state.kinematic_state.transforms_snapshot,
+                                            frame_helpers.GRAV_ALIGNED_BODY_FRAME_NAME, root_frame)
+
+                # transform the pose into flat_body frame
+                odom_T_hand = odom_T_root * math_helpers.SE3Pose.from_obj(root_T_hand)
+
+                # add the point to the trajectory
+                traj_point = trajectory_pb2.SE3TrajectoryPoint(
+                    pose=odom_T_hand.to_proto(), time_since_reference=seconds_to_duration(point_time))
+                point_time += time_increment
+                points += [traj_point]
+
+            hand_traj = trajectory_pb2.SE3Trajectory(points=points)
+
+            # send the trajectory command
+            arm_cartesian_command = arm_command_pb2.ArmCartesianCommand.Request(
+                pose_trajectory_in_task=hand_traj, root_frame_name=frame_helpers.GRAV_ALIGNED_BODY_FRAME_NAME)
+            arm_command = arm_command_pb2.ArmCommand.Request(arm_cartesian_command=arm_cartesian_command)
+            synchronized_command = synchronized_command_pb2.SynchronizedCommand.Request(arm_command=arm_command)
+            robot_command = robot_command_pb2.RobotCommand(synchronized_command=synchronized_command)
+            cmd_id = self._robot_command_client.robot_command(robot_command)
+            while True:
+                feedback_resp = self._robot_command_client.robot_command_feedback(cmd_id)
+                self._logger.info('Distance to final point: ' + '{:.2f} meters'.format(
+                    feedback_resp.feedback.synchronized_feedback.arm_command_feedback.
+                    arm_cartesian_feedback.measured_pos_distance_to_goal) + ', {:.2f} radians'.format(
+                    feedback_resp.feedback.synchronized_feedback.arm_command_feedback.
+                    arm_cartesian_feedback.measured_rot_distance_to_goal))
+
+                if feedback_resp.feedback.synchronized_feedback.arm_command_feedback.arm_cartesian_feedback.status ==\
+                        arm_command_pb2.ArmCartesianCommand.Feedback.STATUS_TRAJECTORY_COMPLETE:
+                    # goal reached
+                    self._logger.info('Move complete.')
+                    break
+                if feedback_resp.feedback.synchronized_feedback.arm_command_feedback.arm_cartesian_feedback.status ==\
+                        arm_command_pb2.ArmCartesianCommand.Feedback.STATUS_TRAJECTORY_STALLED:
+                    # the arm stopped moving towards the goal
+                    self._logger.warning('Robot stalled, stop command issued. Trajectory point is unreachable')
+                    self._robot_command(RobotCommandBuilder.stop_command())
+                    return False
+                time.sleep(0.1)
+            return True
+
+        except Exception as e:
+            print(e)
+            return False
+
+    @try_claim
+    def arm_gaze(self, point, frame):
+        """set gaze of the gripper camera"""
+        robot_state = self._robot_state_client.get_robot_state()
+        body_T_frame = frame_helpers.get_a_tform_b(robot_state.kinematic_state.transforms_snapshot,
+                                                  frame_helpers.GRAV_ALIGNED_BODY_FRAME_NAME, frame)
+
+        point_wrt_frame = geometry_pb2.Vec3(x=point[0], y=point[1], z=point[2])
+        point_Q_frame = geometry_pb2.Quaternion(w=0, x=0, y=0, z=1)
+        frame_T_point = geometry_pb2.SE3Pose(position=point_wrt_frame, rotation=point_Q_frame)
+
+        # transform the point into flat_body frame
+        body_T_point = body_T_frame * math_helpers.SE3Pose.from_obj(frame_T_point)
+        p = body_T_point.get_translation()
+
+        # transform the point to arm base and compute oriented angle and distance
+        # arm base is the pivot point of the first joint projected into xy plane of frame body
+        Va = np.array([[1], [0], [0]])
+        Vb = np.array([[p[0]], [p[1]], [0]])-np.array([[0.292], [0], [0]])
+        Vn = np.array([[0], [0], [1]])
+        angle = float(np.arctan2(np.matmul(np.cross(Va, Vb, axis=0).T, Vn), np.matmul(Va.T, Vb)))
+        self._logger.info("Angle to object is %f" % angle)
+        if abs(angle) > np.deg2rad(130):
+            self._logger.warning("The provided point is behind the robot, gaze is not possible")
+            return False
+        dist = np.linalg.norm(Vb)
+        self._logger.info("Distance to object is %f" % dist)
+
+        # select the gaze point with respect to arm base
+        gaze_x = np.clip(dist, 0.2, 0.5)  # limit the reach
+        gaze_position = np.array([[gaze_x], [0], [0.2]])
+        s = np.sin(angle)
+        c = np.cos(angle)
+        rot = np.array([[c, -s, 0], [s, c, 0], [0, 0, 1]])
+        gaze_rot = np.matmul(rot, gaze_position)
+        self._logger.info("Selected pose in arm base: %s" % str(gaze_rot))
+
+        # transform it back to body frame
+        gaze_tf = gaze_rot + np.array([[0.292], [0], [0]])
+        self._logger.info("Selected pose in body: %s" % str(gaze_tf))
+
+        gaze_vec = geometry_pb2.Vec3(x=gaze_tf[0], y=gaze_tf[1], z=gaze_tf[2])
+        gaze_quat = geometry_pb2.Quaternion(w=0, x=0, y=0, z=1)
+        gaze_pose = geometry_pb2.SE3Pose(position=gaze_vec, rotation=gaze_quat)
+
+        unstow = RobotCommandBuilder.arm_ready_command()
+
+        # Issue the command via the RobotCommandClient
+        unstow_command_id = self._robot_command_client.robot_command(unstow)
+        self._logger.info("Unstow command issued.")
+        block_until_arm_arrives(self._robot_command_client, unstow_command_id, 3.0)
+
+        gaze_command = RobotCommandBuilder.arm_gaze_command(point[0], point[1], point[2], frame,
+                                                            frame2_tform_desired_hand=gaze_pose,
+                                                            frame2_name=frame_helpers.GRAV_ALIGNED_BODY_FRAME_NAME)
+        gripper_command = RobotCommandBuilder.claw_gripper_open_command()
+        synchro_command = RobotCommandBuilder.build_synchro_command(gripper_command, gaze_command)
+
+        # Send the request
+        self._logger.info("Requesting gaze.")
+        gaze_command_id = self._robot_command_client.robot_command(synchro_command)
+
+        block_until_arm_arrives(self._robot_command_client, gaze_command_id, 4.0)
+        return True
 
     ###################################################################
 
